@@ -52,6 +52,7 @@ CONFIG_DEFAULTS = {
     # Folders no agent may write to during a wake, shell commands included (the macOS sandbox enforces it). A repo's
     # .git stays writable, so agents can still make their own worktrees from it.
     "protect": [],  # e.g. ["~/code/main-checkout"]
+    "blocked_tools": [],  # more tool rules a wake must ask about first, e.g. ["Bash(deploy-tool create:*)"]
     "terminal_app": None,  # bundle id brought forward when you click a notification; None = the one crew last ran in
 }
 ICON = Path(__file__).resolve().parent.parent / "assets" / "icon.png"
@@ -123,8 +124,7 @@ TOOL_PRESETS = {
         *(f"Bash(composio execute *{w}*)" for w in ("SEND", "POST", "UPDATE", "DELETE", "CREATE", "ADD", "REMOVE",
                                                     "INVITE", "UPLOAD", "SCHEDULE", "REACT", "ARCHIVE", "JOIN",
                                                     "LEAVE", "SET", "RENAME", "PIN", "EDIT", "REPLY")),
-        "Bash(npm publish:*)", "Bash(pnpm publish:*)", "Bash(ephem create:*)", "Bash(ephem deploy:*)",
-        "Bash(ephem destroy:*)", "Bash(osascript:*)",
+        "Bash(npm publish:*)", "Bash(pnpm publish:*)", "Bash(osascript:*)",
     ],
     "@never": ["Bash(gh pr merge:*)", "Bash(gh pr close:*)", "Bash(git push --force:*)", "Bash(git push -f:*)",
                "Bash(rm -rf:*)", "Bash(gh repo delete:*)", "Bash(gh secret:*)", "Bash(sudo:*)", "Bash(diskutil:*)",
@@ -800,7 +800,7 @@ def wake_tools(agent):
     money. Those stay blocked unless you gave the agent a standing rule for them (agent.json "freedoms")."""
     freedoms = [t for t in agent.get("freedoms", []) if t in GRANTABLE]
     allowed = ["Bash", "Edit", "Write", "NotebookEdit", *expand_tools(agent["tools"]["run"]["allow"]), *freedoms]
-    denied = [t for t in expand_tools(["@public", "@never"]) if t not in freedoms]
+    denied = [t for t in expand_tools(["@public", "@never"]) if t not in freedoms] + config()["blocked_tools"]
     return list(dict.fromkeys(allowed)), denied
 
 
