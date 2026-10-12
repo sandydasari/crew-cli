@@ -2,12 +2,34 @@
   "name": "@sandydasari977/crew",
   "version": "0.1.0",
   "description": "Your own Claude Code agents that work on their own: brief one once, it does the work, keeps its own folder, and checks in only when something is yours to decide.",
-  "keywords": ["claude", "claude-code", "agents", "autonomous-agents", "tmux", "tui", "cli"],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "agents",
+    "autonomous-agents",
+    "tmux",
+    "tui",
+    "cli"
+  ],
+  "author": "Sandydasari977 <sandydasari977@gmail.com>",
   "license": "MIT",
-  "bin": { "crew": "bin/crew.js" },
-  "files": ["bin/", "python/*.py", "python/requirements.txt", "assets/", "README.md", "LICENSE"],
-  "os": ["darwin"],
-  "engines": { "node": ">=18" },
+  "bin": {
+    "crew": "bin/crew.js"
+  },
+  "files": [
+    "bin/",
+    "python/*.py",
+    "python/requirements.txt",
+    "assets/",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "postinstall": "node bin/crew.js --setup-only || true"
   }
