@@ -1238,6 +1238,11 @@ def cmd_tick(args):
         if a.get("mode") != "agentic":
             continue
         reconcile_watches(a)
+        if not is_running(a):  # a wake that died without finishing (killed, crashed, laptop asleep) isn't working
+            conn = db()
+            conn.execute("""UPDATE runs SET status = 'error', finished_at = ?, error = 'interrupted before it finished'
+                            WHERE agent = ? AND status = 'running'""", (now(), n))
+            conn.commit()
         st = agent_state(a)
         if st.get("awake") and st.get("next_wake_at", "") <= now() and not is_running(a):
             start_background_run(n, trigger="its own schedule")
