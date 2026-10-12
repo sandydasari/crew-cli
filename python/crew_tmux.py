@@ -19,6 +19,14 @@ WIDTH_FILE = HOME / "sidebar_width"
 
 TMUX_CONF = """
 set -g mouse on
+# copying: a mouse drag copies to the macOS clipboard; apps' own copies (OSC 52) reach the terminal too
+set -s set-clipboard on
+set -g allow-passthrough on
+set -as terminal-features ',*:clipboard'
+bind -T copy-mode MouseDragEnd1Pane send -X copy-pipe-and-cancel "pbcopy"
+bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "pbcopy"
+bind -T copy-mode DoubleClick1Pane select-pane \\; send -X select-word \\; send -X copy-pipe-and-cancel "pbcopy"
+bind -T copy-mode-vi DoubleClick1Pane select-pane \\; send -X select-word \\; send -X copy-pipe-and-cancel "pbcopy"
 set -s escape-time 0
 set -g focus-events on
 set -s extended-keys on

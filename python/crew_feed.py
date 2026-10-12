@@ -15,7 +15,7 @@ from textual.widgets import Input, Static
 import crew
 import crew_tmux as tx
 import galley  # noqa: F401  (flush-left markdown headings)
-from galley import DONE, GRAPHITE, INK, PAPER, PENCIL, RULE
+from galley import DONE, GRAPHITE, INK, PAPER, PENCIL, RULE, SELECT
 
 HISTORY = 40  # entries shown above the waiting questions
 
@@ -42,6 +42,11 @@ class FeedApp(App):
     #state {{ height: 1; color: {GRAPHITE}; margin-bottom: 1; }}
     #log {{ height: 1fr; scrollbar-size-vertical: 1; scrollbar-color: {RULE}; scrollbar-background: {INK}; }}
     .entry {{ margin-bottom: 1; }}
+    /* yours: indented, on a lifted ground with a green rule; the agent's: flush left on the page */
+    .mine {{ margin: 0 0 1 6; background: {SELECT}; border-left: thick {DONE}; padding: 0 1; }}
+    .working {{ border-left: thick {PENCIL}; padding: 0 1; }}
+    .theirs {{ margin-right: 4; }}
+    .answer {{ margin-left: 6; border-left: thick {RULE}; padding: 0 1; }}
     #asks {{ height: auto; max-height: 60%; overflow-y: auto; border-top: solid {RULE}; padding-top: 1; }}
     #busy {{ height: auto; color: {GRAPHITE}; }}
     Input {{ background: {INK}; border: tall {RULE}; color: {PAPER}; margin-top: 1; }}
@@ -50,7 +55,8 @@ class FeedApp(App):
     """
     BINDINGS = [Binding("ctrl+n", "next_question", "next question"),
                 Binding("ctrl+x", "dismiss", "dismiss question"),
-                Binding("ctrl+l", "clear", "clear the feed")]
+                Binding("ctrl+l", "clear", "clear the feed"),
+                Binding("ctrl+o", "toggle_steps", "show or hide what it did")]
 
     def __init__(self, agent_name):
         super().__init__()
@@ -59,6 +65,8 @@ class FeedApp(App):
         self.active = 0  # which waiting question the number keys answer
         self.pending = []
         self.busy = ""
+        self.show_steps = False  # every step of finished wakes; a running wake always shows its latest
+        self.signature_seen = False
 
     def compose(self) -> ComposeResult:
         yield Static(self.name_, id="head")
@@ -77,27 +85,55 @@ class FeedApp(App):
 
     # ---------------------------------------------------------- data
 
+    def agent_head(self, when):
+        head = Text()
+        head.append("∴ ", style=f"bold {PENCIL}")
+        head.append(self.name_, style=f"bold {PAPER}")
+        head.append(f"   {when}", style=GRAPHITE)
+        return head
+
+    def steps_text(self, steps):
+        t = Text()
+        for i, (at, who, text) in enumerate(steps):
+            t.append("\n" if i else "")
+            t.append(f"{at[:5]}  ", style=GRAPHITE)
+            if who == "helper":
+                t.append("  ↳ ", style=GRAPHITE)
+            t.append(text, style=GRAPHITE if text.startswith("says:") else PAPER)
+        return t
+
     def entries(self, conn):
-        """(ts, renderable) for wakes, chat messages and answered questions, oldest first (since the last clear)."""
+        """(ts, kind, renderable) for wakes, chat messages and answered questions, oldest first, since the last clear.
+        kind is mine (you), theirs (the agent) or answer (a question you answered)."""
         out = []
         since = crew.agent_state(self.agent).get("feed_since") or ""
-        for r in conn.execute("""SELECT * FROM runs WHERE agent = ? AND (report IS NOT NULL OR status = 'error')
+        for r in conn.execute("""SELECT * FROM runs WHERE agent = ? AND (report IS NOT NULL OR status IN ('error', 'running'))
                                  ORDER BY id DESC LIMIT ?""", (self.name_, HISTORY)):
-            head = Text()
-            head.append(self.name_, style=f"bold {PAPER}")
-            head.append(f"   woke {crew.ago(r['started_at'])}" + (f" · {r['trigger']}" if r["trigger"] else ""),
-                        style=GRAPHITE)
-            if r["status"] == "ok":
-                out.append((r["started_at"], Group(head, Markdown(r["report"]))))
-            else:
-                out.append((r["started_at"], Group(head, Text(f"That wake failed: {(r['error'] or '')[:300]}",
-                                                              style=PENCIL))))
+            steps = crew.read_activity(r["session_id"]) if r["session_id"] else []
+            why = f" · {r['trigger']}" if r["trigger"] else ""
+            if r["status"] == "running":
+                head = self.agent_head(f"working now · started {crew.ago(r['started_at'])}{why} · {len(steps)} steps")
+                body = self.steps_text(steps[-12:]) if steps else Text("getting started…", style=GRAPHITE)
+                out.append((r["started_at"], "theirs working", Group(head, body)))
+                continue
+            head = self.agent_head(f"woke {crew.ago(r['started_at'])}{why}")
+            body = Markdown(r["report"]) if r["status"] == "ok" else \
+                Text(f"That wake failed: {(r['error'] or '')[:300]}", style=PENCIL)
+            parts = [head, body]
+            if steps and self.show_steps:
+                parts += [Text(f"what it did ({len(steps)} steps)", style=f"bold {GRAPHITE}"), self.steps_text(steps)]
+            elif steps:
+                parts.append(Text(f"{len(steps)} steps · ctrl+o to see what it did", style=GRAPHITE))
+            out.append((r["started_at"], "theirs", Group(*parts)))
         for m in conn.execute("SELECT * FROM chat WHERE agent = ? ORDER BY id DESC LIMIT ?", (self.name_, HISTORY)):
-            head = Text("you" if m["role"] == "user" else self.name_, style=f"bold {PAPER if m['role'] != 'user' else DONE}")
-            head.append(f"   {crew.ago(m['ts'])}", style=GRAPHITE)
-            body = Text(m["text"], style=PAPER) if m["role"] == "user" else Markdown(m["text"] or "_(no reply)_")
-            out.append((m["ts"], Group(head, body)))
-        for d in conn.execute("""SELECT * FROM decisions WHERE agent = ? AND status NOT IN ('pending', 'closed')
+            if m["role"] == "user":
+                head = Text("you", style=f"bold {DONE}")
+                head.append(f"   {crew.ago(m['ts'])}", style=GRAPHITE)
+                out.append((m["ts"], "mine", Group(head, Text(m["text"], style=PAPER))))
+            else:
+                out.append((m["ts"], "theirs", Group(self.agent_head(crew.ago(m["ts"])),
+                                                     Markdown(m["text"] or "_(no reply)_"))))
+        for d in conn.execute("""SELECT * FROM decisions WHERE agent = ? AND status NOT IN ('pending', 'closed', 'dismissed')
                                  AND answered_at IS NOT NULL ORDER BY id DESC LIMIT ?""", (self.name_, HISTORY)):
             t = Text()
             t.append("you answered", style=f"bold {DONE}")
@@ -107,7 +143,7 @@ class FeedApp(App):
             parts = [t]
             if d["outcome"] and d["outcome"] != d["answer"]:
                 parts.append(Markdown(d["outcome"]))
-            out.append((d["answered_at"], Group(*parts)))
+            out.append((d["answered_at"], "answer", Group(*parts)))
         out = [e for e in out if (e[0] or "") >= since]
         out.sort(key=lambda e: e[0] or "")
         return out[-HISTORY:]
@@ -120,8 +156,12 @@ class FeedApp(App):
         self.active = min(self.active, max(0, len(self.pending) - 1))
         self.query_one("#state", Static).update(Text(crew.agent_status_text(self.agent).split(" · ", 1)[1]
                                                      + self.doing(), style=GRAPHITE))
-        sig = (conn.execute("SELECT MAX(id), COUNT(*) FROM runs WHERE agent = ? AND (report IS NOT NULL OR status = 'error')",
-                            (self.name_,)).fetchone()[:],
+        running = conn.execute("SELECT session_id FROM runs WHERE agent = ? AND status = 'running'",
+                               (self.name_,)).fetchall()
+        live = [crew.activity_path(r["session_id"]).stat().st_size if r["session_id"] and
+                crew.activity_path(r["session_id"]).exists() else 0 for r in running]
+        sig = (conn.execute("SELECT MAX(id), COUNT(*), GROUP_CONCAT(status) FROM runs WHERE agent = ?",
+                            (self.name_,)).fetchone()[:], live, self.show_steps,
                conn.execute("SELECT MAX(id) FROM chat WHERE agent = ?", (self.name_,)).fetchone()[0],
                conn.execute("SELECT MAX(answered_at) FROM decisions WHERE agent = ?", (self.name_,)).fetchone()[0],
                [d["id"] for d in self.pending], self.active, self.busy, self.size.width)
@@ -132,10 +172,13 @@ class FeedApp(App):
         log.remove_children()
         entries = self.entries(conn)
         if not entries:
-            entries = [("", Text(f"Nothing yet. {self.name_} reports here after each wake; press r in the rail to "
+            entries = [("", "theirs", Text(f"Nothing yet. {self.name_} reports here after each wake; press r in the rail to "
                                  "wake it now, or message it below.", style=GRAPHITE))]
-        log.mount_all([Static(r, classes="entry") for _, r in entries])
-        log.call_after_refresh(log.scroll_end, animate=False)
+        at_end = log.scroll_y >= log.max_scroll_y - 1
+        log.mount_all([Static(r, classes=f"entry {kind}") for _, kind, r in entries])
+        if at_end or not self.signature_seen:  # follow new steps, unless you've scrolled up to read
+            log.call_after_refresh(log.scroll_end, animate=False)
+        self.signature_seen = True
         self.render_asks()
         self.query_one("#busy", Static).update(Text(self.busy, style=GRAPHITE) if self.busy else "")
         self.render_hint()
@@ -181,7 +224,7 @@ class FeedApp(App):
             if len(self.pending) > 1:
                 keys.append(("ctrl+n", "next question"))
             keys.append(("ctrl+x", "dismiss"))
-        keys.append(("ctrl+l", "clear"))
+        keys += [("ctrl+o", "hide steps" if self.show_steps else "what it did"), ("ctrl+l", "clear")]
         keys += [("enter", "send (empty: full chat)"), ("alt ←", "rail")]
         t = Text()
         for k, word in keys:
@@ -214,6 +257,18 @@ class FeedApp(App):
             self.busy = f"Couldn't carry that out: {str(e)[:200]}"
         self.signature = None
         self.call_from_thread(self.render_feed)
+
+    def on_text_selected(self, event):
+        """Select text with the mouse and it's copied, like a terminal."""
+        text = self.screen.get_selected_text()
+        if text and text.strip():
+            crew.copy_text(text)
+            self.notify("copied", timeout=1.5)
+
+    def action_toggle_steps(self):
+        self.show_steps = not self.show_steps
+        self.signature = None
+        self.render_feed()
 
     def action_clear(self):
         """Start the feed fresh. History stays in crew (crew runs, crew inbox); waiting questions stay."""

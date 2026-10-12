@@ -201,6 +201,13 @@ class NavApp(App):
             return {}
         return self.data.get(ol.get_option_at_index(ol.highlighted).id, {})
 
+    def on_text_selected(self, event):
+        """Select text with the mouse and it's copied, like a terminal."""
+        text = self.screen.get_selected_text()
+        if text and text.strip():
+            crew.copy_text(text)
+            self.notify("copied", timeout=1.5)
+
     def on_option_list_option_selected(self, event: OptionList.OptionSelected):
         self.open(self.data.get(event.option.id, {}))
 

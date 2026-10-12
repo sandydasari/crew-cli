@@ -93,6 +93,13 @@ class HomeApp(App):
             f.add_option(Option(Text("Quiet so far. Start an agent with s in the rail, or press r to wake one now.",
                                      style=GRAPHITE), disabled=True))
 
+    def on_text_selected(self, event):
+        """Select text with the mouse and it's copied, like a terminal."""
+        text = self.screen.get_selected_text()
+        if text and text.strip():
+            crew.copy_text(text)
+            self.notify("copied", timeout=1.5)
+
     def on_option_list_option_selected(self, event: OptionList.OptionSelected):
         agent = (event.option.id or "").removeprefix("a:")
         if agent in crew.agent_names():

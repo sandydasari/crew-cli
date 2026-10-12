@@ -20,7 +20,7 @@ work. For clickable notifications: `brew install terminal-notifier`.
 `crew` opens a tmux workspace. On the left, your agents and what each one is doing; on the right, the one you picked.
 
 - **Feed**: each agent's conversation. Its wake reports, your messages and its replies, what you answered, and
-  the questions waiting on you: press `1`–`n` to answer, `ctrl+n` for the next one, `ctrl+x` to dismiss, `ctrl+l` to clear the feed. Type to
+  the questions waiting on you: press `1`–`n` to answer, `ctrl+n` for the next one, `ctrl+x` to dismiss, `ctrl+l` to clear the feed, `ctrl+o` to see each step it took (a running wake shows them live). Select text to copy it. Type to
   message it. Enter on an empty line opens the full Claude Code chat with it.
 - **Activity**: what every agent did, newest first, with anything that needs you on top.
 - **Threads**: split a topic off into its own chat (“take this into a separate chat”).

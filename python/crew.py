@@ -25,6 +25,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -424,22 +425,110 @@ def sandbox_prefix(paths):
     return ["sandbox-exec", "-p", "(version 1)(allow default)(deny file-write* " + " ".join(rules) + ")"]
 
 
+ACTIVITY = LOGS / "activity"  # one file per session: what a wake did, step by step, as it happens
+
+
+def activity_path(session_id):
+    return ACTIVITY / f"{session_id}.log"
+
+
+def copy_text(text):
+    """Put text on the macOS clipboard (works inside tmux, where terminal clipboard escapes often don't)."""
+    subprocess.run(["pbcopy"], input=text, text=True)
+
+
+def describe_step(block):
+    """One plain line for a tool call or a remark, as the feed shows it. None for steps not worth showing."""
+    if block.get("type") == "text":
+        line = next((l.strip() for l in block.get("text", "").splitlines() if l.strip()), "")
+        return f"says: {line[:160]}" if line else None
+    if block.get("type") != "tool_use":
+        return None
+    name, inp = block.get("name", ""), block.get("input") or {}
+    first = lambda v: str(v or "").strip().splitlines()[0][:160] if str(v or "").strip() else ""
+    if name == "StructuredOutput":
+        return "wrote its report"
+    if name == "Bash":
+        return f"$ {first(inp.get('command'))}"
+    if name in ("Read", "NotebookRead"):
+        return f"read {inp.get('file_path', '')}"
+    if name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        return f"{'wrote' if name == 'Write' else 'edited'} {inp.get('file_path') or inp.get('notebook_path', '')}"
+    if name in ("Grep", "Glob"):
+        return f"searched for {first(inp.get('pattern'))}" + (f" in {inp['path']}" if inp.get("path") else "")
+    if name in ("Agent", "Task"):
+        return f"started a helper: {first(inp.get('description') or inp.get('prompt'))}"
+    if name == "Skill":
+        return f"used the {inp.get('skill') or inp.get('name', '')} skill"
+    if name in ("WebFetch", "WebSearch"):
+        return f"{'fetched' if name == 'WebFetch' else 'searched the web for'} {first(inp.get('url') or inp.get('query'))}"
+    if name.startswith("mcp__"):
+        _, server, tool = (name.split("__", 2) + ["", ""])[:3]
+        return f"{server}: {tool.replace('_', ' ')}"
+    if name in ("TodoWrite", "ToolSearch"):
+        return None
+    return name
+
+
 def run_claude(prompt, *, session_id, resume, cwd, allowed, denied, schema, model, mode="dontAsk", add_dirs=(),
                protect=(), timeout=CLAUDE_TIMEOUT):
-    cmd = [*sandbox_prefix(protect), "claude", "-p", prompt, "--output-format", "json", "--json-schema", json.dumps(schema),
-           "--permission-mode", mode]
+    """Run headless Claude Code and return (structured output, cost). Each step it takes is appended to
+    activity_path(session_id) as it happens, so the feed can show the work live."""
+    cmd = [*sandbox_prefix(protect), "claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
+           "--json-schema", json.dumps(schema), "--permission-mode", mode]
     cmd += claude_args(session_id=session_id, resume=resume, allowed=allowed, denied=denied, model=model,
                        add_dirs=add_dirs)
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
     LOGS.mkdir(parents=True, exist_ok=True)
-    (LOGS / f"{session_id or 'oneoff'}.{int(time.time())}.json").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
+    ACTIVITY.mkdir(parents=True, exist_ok=True)
+    raw = open(LOGS / f"{session_id or 'oneoff'}.{int(time.time())}.json", "w")
+    steps = open(activity_path(session_id or "oneoff"), "a")
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                            text=True)
+    timer = threading.Timer(timeout, proc.kill)  # a wake that hangs, even silently, is stopped on time
+    timer.start()
+    result = None
     try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[-400:] or proc.stdout[-400:]}")
-    if data.get("is_error") or not data.get("structured_output"):
-        raise RuntimeError(f"claude returned no structured output ({data.get('subtype')}): {str(data.get('result'))[:400]}")
-    return data["structured_output"], data.get("total_cost_usd") or 0
+        for line in proc.stdout:
+            raw.write(line)
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "result":
+                result = ev
+            elif ev.get("type") == "assistant":
+                helper = bool(ev.get("parent_tool_use_id"))  # a helper's own steps
+                for block in ev.get("message", {}).get("content", []):
+                    text = describe_step(block)
+                    if text:
+                        steps.write(f"{dt.datetime.now():%H:%M:%S}\t{'helper' if helper else 'main'}\t"
+                                    f"{text.replace(chr(9), ' ').replace(chr(10), ' ')}\n")
+                        steps.flush()
+        proc.wait(timeout=30)
+    finally:
+        timed_out = not timer.is_alive() and proc.returncode not in (0, None)
+        timer.cancel()
+        err = proc.stderr.read() if proc.stderr else ""
+        raw.write("\n--- stderr ---\n" + err)
+        raw.close()
+        steps.close()
+    if not result:
+        if timed_out:
+            raise RuntimeError(f"timed out after {timeout // 60} minutes")
+        raise RuntimeError(f"claude exited {proc.returncode}: {err.strip()[-400:]}")
+    if result.get("is_error") or not result.get("structured_output"):
+        raise RuntimeError(f"claude returned no structured output ({result.get('subtype')}): {str(result.get('result'))[:400]}")
+    return result["structured_output"], result.get("total_cost_usd") or 0
+
+
+def read_activity(session_id, last=None):
+    """[(time, who, text)] of a session's steps; who is main or helper."""
+    try:
+        lines = activity_path(session_id).read_text().splitlines()
+    except OSError:
+        return []
+    rows = [tuple((l.split("\t", 2) + ["", ""])[:3]) for l in lines if l.strip()]
+    return rows[-last:] if last else rows
 
 
 def item_fields(row):
