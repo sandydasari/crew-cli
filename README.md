@@ -8,7 +8,7 @@ Brief an agent once, in plain words. It writes its own job description, does the
 and checks in only when something is yours to decide. You keep it all in a terminal workspace next to your editor.
 
 ```bash
-npm install -g @sandydasari977/crew
+npm install -g @sandydasari/crew
 crew
 ```
 
