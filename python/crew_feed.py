@@ -15,7 +15,7 @@ from textual.widgets import Input, Static
 import crew
 import crew_tmux as tx
 import galley  # noqa: F401  (flush-left markdown headings)
-from galley import DONE, GRAPHITE, INK, PAPER, PENCIL, RULE, SELECT
+from galley import DONE, GRAPHITE, INK, PAPER, PENCIL, RULE, SELECT  # noqa: F401
 
 HISTORY = 40  # entries shown above the waiting questions
 
@@ -47,7 +47,10 @@ class FeedApp(App):
     .working {{ border-left: thick {PENCIL}; padding: 0 1; }}
     .theirs {{ margin-right: 4; }}
     .answer {{ margin-left: 6; border-left: thick {RULE}; padding: 0 1; }}
-    #asks {{ height: auto; max-height: 60%; overflow-y: auto; border-top: solid {RULE}; padding-top: 1; }}
+    /* the question: a card of its own, set apart from the conversation above */
+    #asks {{ height: auto; max-height: 60%; border: round {PENCIL}; background: {SELECT}; padding: 0 1;
+             margin-top: 1; scrollbar-size-vertical: 1; scrollbar-color: {RULE}; scrollbar-background: {SELECT}; }}
+    #ask {{ background: {SELECT}; }}
     #busy {{ height: auto; color: {GRAPHITE}; }}
     Input {{ background: {INK}; border: tall {RULE}; color: {PAPER}; margin-top: 1; }}
     Input:focus {{ border: tall {GRAPHITE}; }}
@@ -56,7 +59,8 @@ class FeedApp(App):
     BINDINGS = [Binding("ctrl+n", "next_question", "next question"),
                 Binding("ctrl+x", "dismiss", "dismiss question"),
                 Binding("ctrl+l", "clear", "clear the feed"),
-                Binding("ctrl+o", "toggle_steps", "show or hide what it did")]
+                Binding("ctrl+o", "toggle_steps", "show or hide what it did"),
+                Binding("ctrl+e", "toggle_details", "show or hide the question's details")]
 
     def __init__(self, agent_name):
         super().__init__()
@@ -66,13 +70,15 @@ class FeedApp(App):
         self.pending = []
         self.busy = ""
         self.show_steps = False  # every step of finished wakes; a running wake always shows its latest
+        self.show_details = False  # the question's evidence and drafts
         self.signature_seen = False
 
     def compose(self) -> ComposeResult:
         yield Static(self.name_, id="head")
         yield Static("", id="state")
         yield VerticalScroll(id="log")
-        yield Static("", id="asks")
+        with VerticalScroll(id="asks"):
+            yield Static("", id="ask")
         yield Static("", id="busy")
         yield AnswerInput(self.answer_digit, placeholder="Message it, or press a number to answer", id="msg")
         yield Static("", id="hint")
@@ -129,21 +135,14 @@ class FeedApp(App):
             if m["role"] == "user":
                 head = Text("you", style=f"bold {DONE}")
                 head.append(f"   {crew.ago(m['ts'])}", style=GRAPHITE)
-                out.append((m["ts"], "mine", Group(head, Text(m["text"], style=PAPER))))
+                text = m["text"]
+                if text.startswith("> "):  # your answer to one of its questions
+                    asked, _, text = text[2:].partition("\n")
+                    head.append(f"   answering: {asked[:90]}", style=GRAPHITE)
+                out.append((m["ts"], "mine", Group(head, Text(text, style=PAPER))))
             else:
                 out.append((m["ts"], "theirs", Group(self.agent_head(crew.ago(m["ts"])),
                                                      Markdown(m["text"] or "_(no reply)_"))))
-        for d in conn.execute("""SELECT * FROM decisions WHERE agent = ? AND status NOT IN ('pending', 'closed', 'dismissed')
-                                 AND answered_at IS NOT NULL ORDER BY id DESC LIMIT ?""", (self.name_, HISTORY)):
-            t = Text()
-            t.append("you answered", style=f"bold {DONE}")
-            t.append(f"   {crew.ago(d['answered_at'])}\n", style=GRAPHITE)
-            t.append(d["question"], style=f"strike {GRAPHITE}")
-            t.append(f"\n{d['answer'] or d['status']}", style=PAPER)
-            parts = [t]
-            if d["outcome"] and d["outcome"] != d["answer"]:
-                parts.append(Markdown(d["outcome"]))
-            out.append((d["answered_at"], "answer", Group(*parts)))
         out = [e for e in out if (e[0] or "") >= since]
         out.sort(key=lambda e: e[0] or "")
         return out[-HISTORY:]
@@ -189,40 +188,57 @@ class FeedApp(App):
         return f" · {doing}" if doing else ""
 
     def render_asks(self):
-        asks = self.query_one("#asks", Static)
+        asks = self.query_one("#asks", VerticalScroll)
+        msg = self.query_one("#msg", Input)
         if not self.pending:
             asks.display = False
+            msg.placeholder = f"Message {self.name_}"
             return
         asks.display = True
         d = self.pending[self.active]
         options = json.loads(d["options"])
+        why, _, details = (d["context"] or "").partition("<!--details-->")
+        msg.placeholder = f"Type your answer, or press 1–{len(options)}"
         head = Text()
-        head.append("▍ ", style=PENCIL)
-        head.append(f"{self.name_} needs you", style=f"bold {PENCIL}")
+        head.append(f"{self.name_} asks", style=f"bold {PENCIL}")
         if len(self.pending) > 1:
-            head.append(f"   question {self.active + 1} of {len(self.pending)}", style=GRAPHITE)
-        head.append(f"   {crew.short_key(d['item_key'])}", style=GRAPHITE)
-        q = Text("▍ ", style=PENCIL)
-        q.append(d["question"], style=f"bold {PAPER}")
-        opts = Text()  # the choices sit right under the question, so the keys are always in view
+            head.append(f"  ·  {self.active + 1} of {len(self.pending)}", style=GRAPHITE)
+        if d["item_key"]:
+            head.append(f"  ·  {crew.short_key(d['item_key'])}", style=GRAPHITE)
+        q = Text(d["question"], style=f"bold {PAPER}")
+        lines = [l for l in why.strip().splitlines() if l.strip()]
+        short = "\n".join(lines if self.show_details else lines[:4]) + ("\n…" if len(lines) > 4 and not self.show_details else "")
+        opts = Text()
+        rec = (d["recommendation"] or "").lower()
         for i, o in enumerate(options, 1):
-            opts.append(f"\n  {i}  ", style=f"bold {PAPER}")
-            opts.append(o, style=PAPER)
-        rec = Text("\n  Recommended  ", style=GRAPHITE)
-        rec.append(d["recommendation"], style=PAPER)
-        parts = [head, q, opts, rec, Text(""), Markdown(d["context"])]
-        if d["drafts"]:
-            parts += [Text(""), Text("Drafted (not posted yet)", style=f"bold {GRAPHITE}"), Markdown(d["drafts"])]
-        asks.update(Group(*parts))
+            opts.append("\n" if i > 1 else "")
+            opts.append(f" {i} ", style=f"bold {INK} on {PENCIL}")
+            opts.append(f"  {o}", style=PAPER)
+            if i == 1 and rec and (o.lower()[:20] in rec or rec.startswith(o.lower()[:12])):
+                opts.append("   suggested", style=GRAPHITE)
+        parts = [head, q, Text(""), Markdown(short) if short.strip() else Text(""), Text(""), opts]
+        if d["recommendation"]:
+            parts += [Text(""), Text(f"Why {self.name_} suggests it: {d['recommendation']}", style=GRAPHITE)]
+        more = details.strip() or d["drafts"]
+        if self.show_details:
+            if details.strip():
+                parts += [Text(""), Text("Details", style=f"bold {GRAPHITE}"), Markdown(details.strip())]
+            if d["drafts"]:
+                parts += [Text(""), Text("What it would post", style=f"bold {GRAPHITE}"), Markdown(d["drafts"])]
+        elif more:
+            parts += [Text(""), Text("ctrl+e for details" + (" and what it would post" if d["drafts"] else ""),
+                                     style=GRAPHITE)]
+        self.query_one("#ask", Static).update(Group(*parts))
         asks.scroll_home(animate=False)
 
     def render_hint(self):
         keys = []
         if self.pending:
             n = len(json.loads(self.pending[self.active]["options"]))
-            keys.append((f"1–{n}" if n > 1 else "1", "answer"))
+            keys.append((f"1–{n}" if n > 1 else "1", "answer, or type it"))
+            keys.append(("ctrl+e", "less" if self.show_details else "details"))
             if len(self.pending) > 1:
-                keys.append(("ctrl+n", "next question"))
+                keys.append(("ctrl+n", "next"))
             keys.append(("ctrl+x", "dismiss"))
         keys += [("ctrl+o", "hide steps" if self.show_steps else "what it did"), ("ctrl+l", "clear")]
         keys += [("enter", "send (empty: full chat)"), ("alt ←", "rail")]
@@ -241,7 +257,7 @@ class FeedApp(App):
         options = json.loads(d["options"])
         if not 1 <= n <= len(options):
             return False
-        self.busy = f"{self.name_} is carrying out: {options[n - 1]}…"
+        self.busy = f"{self.name_} is on it: {options[n - 1]}…"
         self.signature = None
         self.render_feed()
         self.carry_out(d, options[n - 1])
@@ -265,6 +281,11 @@ class FeedApp(App):
             crew.copy_text(text)
             self.notify("copied", timeout=1.5)
 
+    def action_toggle_details(self):
+        self.show_details = not self.show_details
+        self.signature = None
+        self.render_feed()
+
     def action_toggle_steps(self):
         self.show_steps = not self.show_steps
         self.signature = None
@@ -279,6 +300,7 @@ class FeedApp(App):
     def action_next_question(self):
         if self.pending:
             self.active = (self.active + 1) % len(self.pending)
+            self.show_details = False
             self.render_feed()
 
     def action_dismiss(self):
@@ -300,6 +322,13 @@ class FeedApp(App):
         if self.busy:
             self.notify(f"{self.name_} is still busy with the last thing.")
             event.input.value = text
+            return
+        if self.pending:
+            d = self.pending[self.active]
+            self.busy = f"{self.name_} is on it…"
+            self.signature = None
+            self.carry_out(d, text)
+            self.set_timer(0.3, self.render_feed)
             return
         self.busy = f"{self.name_} is thinking…"
         self.signature = None

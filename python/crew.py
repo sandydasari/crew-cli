@@ -129,7 +129,7 @@ TOOL_PRESETS = {
     ],
     "@never": ["Bash(gh pr merge:*)", "Bash(gh pr close:*)", "Bash(git push --force:*)", "Bash(git push -f:*)",
                "Bash(rm -rf:*)", "Bash(gh repo delete:*)", "Bash(gh secret:*)", "Bash(sudo:*)", "Bash(diskutil:*)",
-               "Bash(launchctl:*)", "Bash(crew decide:*)", "Bash(crew answered:*)", "Bash(crew remove:*)",
+               "Bash(launchctl:*)", "Bash(crew decide:*)", "Bash(crew answered:*)", "Bash(crew answer:*)", "Bash(crew remove:*)",
                "Bash(crew learn:*)", "Bash(crew run:*)", "Bash(crew tick:*)", "Bash(crew ui:*)", "Bash(crew chat:*)"],
 }
 GRANTABLE = [t for t in TOOL_PRESETS["@public"] if t not in TOOL_PRESETS["@never"]]
@@ -137,10 +137,11 @@ GRANTABLE = [t for t in TOOL_PRESETS["@public"] if t not in TOOL_PRESETS["@never
 ACT_SCHEMA = {
     "type": "object",
     "properties": {
-        "done": {"type": "boolean"},
-        "summary": {"type": "string", "description": "What you did, with links to anything you posted or pushed."},
+        "done": {"type": "boolean", "description": "True when you carried out their answer, or it meant doing nothing."},
+        "keep_open": {"type": "boolean", "description": "True when their reply was a question or unclear, so the question stays open."},
+        "reply": {"type": "string", "description": "Markdown, short and plain: what you did (with links to anything posted or pushed), or your answer to their question. No hashes or ids."},
     },
-    "required": ["done", "summary"],
+    "required": ["done", "keep_open", "reply"],
 }
 
 VERDICT_COLORS = {
@@ -819,14 +820,15 @@ AGENTIC_SCHEMA = {
                     "about": {"type": "string", "description": "owner/repo#number when it's about a PR or issue; otherwise a short kebab-case topic key."},
                     "title": {"type": "string", "description": "The PR's title, or a short title for the topic."},
                     "category": {"type": "string", "description": "Short kebab-case kind of question, the same across wakes (e.g. post-review, push-fix, rerun-ci, send-slack), so repeated answers can become a standing rule. 'standing-rule' when proposing one."},
-                    "question": {"type": "string"},
-                    "context": {"type": "string", "description": "Markdown. What it is, what you already did, and why this needs the user."},
-                    "options": {"type": "array", "items": {"type": "string"}, "minItems": 2},
-                    "recommendation": {"type": "string"},
+                    "question": {"type": "string", "description": "One plain sentence a busy person understands at a glance, e.g. 'Push the 5 fixes and post your 4 replies on #12780?'. No hashes or ids."},
+                    "context": {"type": "string", "description": "2-4 short plain lines: what this is and why it's their call. No commit hashes, thread ids, file paths or script names; a PR number or link is fine."},
+                    "options": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 4, "description": "Short choices, under 8 words each, your recommended one first. Each is something you then do yourself; never 'run it yourself' or 'unblock a tool'."},
+                    "recommendation": {"type": "string", "description": "One short sentence: which option and why."},
+                    "details": {"type": "string", "description": "Markdown. Everything else the user might want before deciding (evidence, specifics, commits). Shown only when they ask. Empty if nothing."},
                     "drafts": {"type": "string", "description": "Markdown. The exact comments/reviews/messages you would post if approved, each with where it goes (file:line, PR conversation, channel). Empty if nothing would be posted."},
                     "grant": {"type": "array", "items": {"type": "string"}, "description": "Only for 'standing-rule': the blocked tool rules you'd use on your own from then on, exactly as listed to you. Empty otherwise."},
                 },
-                "required": ["about", "title", "category", "question", "context", "options", "recommendation", "drafts", "grant"],
+                "required": ["about", "title", "category", "question", "context", "options", "recommendation", "details", "drafts", "grant"],
             },
         },
         "resolved": {"type": "array", "items": {"type": "integer"}, "description": "Ids of waiting decisions that no longer need the user (merged, closed, already handled, superseded by a new one)."},
@@ -1098,7 +1100,11 @@ def run_agentic(agent, trigger="manual", note=None):
         "pushing, opening PRs, sending messages, changing tickets; before destroying anything outside your folder; and "
         "before spending money (e.g. creating environments). Those tools are blocked in your wakes"
         + (f", except the standing rules the user gave you: {', '.join(freedoms)}" if freedoms else "")
-        + ". Put the exact text you'd post into the decision's `drafts`, worded the way the user writes.",
+        + ". Put the exact text you'd post into the decision's `drafts`, worded the way the user writes. When the "
+        "user answers, crew resumes you with permission to do exactly what they approved (push, post, message), so "
+        "never ask them to run commands or scripts themselves, or to unblock tools.",
+        "- Write questions for a busy person: one plain sentence, 2-4 lines of why, short options with yours first. "
+        "Hashes, ids, paths and evidence go in `details`, which they open only if they want to.",
         f"- Code changes go in your own git worktree under {d}/work/ (`git worktree add {d}/work/<name> -b <branch>` "
         "from the repo, or the PR's branch), never in the user's checkouts"
         + (f" ({', '.join(protect)} is read-only to you)" if protect else "") + ". Run the tests, commit locally; "
@@ -1144,7 +1150,9 @@ def run_agentic(agent, trigger="manual", note=None):
                          (name, key, q["title"], url, now(), now()))
             conn.execute("""INSERT INTO decisions (agent, item_key, run_id, question, context, options, recommendation,
                             drafts, created_at, category, grant_tools) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                         (name, key, run_id, q["question"], q["context"], json.dumps(q["options"]), q["recommendation"],
+                         (name, key, run_id, q["question"],
+                          q["context"].strip() + (f"\n\n<!--details-->\n\n" + q["details"].strip() if q["details"].strip() else ""),
+                          json.dumps(q["options"]), q["recommendation"],
                           q["drafts"], now(), q["category"], json.dumps(grant)))
         nxt = dt.datetime.now().astimezone() + dt.timedelta(minutes=out["next_wake_minutes"])
         watches = [{"name": re.sub(r"[^a-z0-9-]+", "-", w["name"].lower()).strip("-") or "watch", "command": w["command"]}
@@ -1584,10 +1592,11 @@ def chat_system(agent):
             "When the user tells you how they like things (what to focus on, what to skip, how to word comments, "
             "how they handle feedback), add it to KNOWLEDGE.md so every future wake uses it. You decide what to work "
             "on; the user steers you by talking to you.\n"
-            f"Things waiting on the user: `crew asks {agent['name']}` (each with its drafted comments). When the user "
-            "opens this chat or asks what needs them, go through those. When they approve a draft, post exactly what "
-            "they approved (Claude Code will ask their permission for each post; that is their sign-off), then run "
-            f"`crew answered <id> \"<what you did>\"`. If they decline, run `crew answered <id> \"declined: <why>\"`.\n"
+            f"Things waiting on the user (`crew asks {agent['name']}` has them in full):\n{waiting_text(agent)}\n"
+            "When the user's message answers, approves or declines one of those ('yes push all', 'skip it', 'post it "
+            "but drop the nit'), run `crew answer <id> \"<their words>\"`: crew has you carry it out with the "
+            "permission their answer gives (pushing, posting) and prints what was done. Tell them that in a line or "
+            "two. Don't push or post yourself from this chat, and never ask them to run commands or unblock tools.\n"
             "To act on something now, run "
             f"`crew run {agent['name']} --note \"<what they asked for>\"`. Every comment you'd post is a draft "
             "until the user approves it.\n"
@@ -1603,6 +1612,13 @@ def recent_reports(agent, n=3):
         return ""
     return ("What you reported on your latest wakes (newest first; the user has seen these in your feed):\n"
             + "\n".join(f"--- {r['started_at']} ---\n{r['report'][:1500]}" for r in rows) + "\n---\n")
+
+
+def waiting_text(agent):
+    rows = db().execute("SELECT id, item_key, question, options FROM decisions WHERE agent = ? AND status = 'pending' "
+                        "ORDER BY id", (agent["name"],)).fetchall()
+    return "\n".join(f"- #{r['id']} ({short_key(r['item_key'])}) {r['question']} Options: "
+                     + "; ".join(json.loads(r["options"] or "[]")) for r in rows) or "- nothing right now"
 
 
 def session_exists(session_id):
@@ -1904,52 +1920,88 @@ def cmd_ask(args):
 # ---------------------------------------------------------------- decide
 
 def act(conn, agent, row, d, answer, quiet=False):
-    prompt = (f"The human answered your decision on {row['url'] or row['key']}.\nQuestion: {d['question']}\nAnswer: {answer}\n\n"
-              "Carry out exactly that answer now, and nothing beyond it. For this step you may take the outward-facing "
-              "actions the answer calls for (post, comment, edit, commit, push). If the answer means doing nothing, do nothing.\n"
-              + (f"Post the drafts exactly as approved:\n{d['drafts']}\n" if d["drafts"] else "")
-              + f"If the user's answer or note tells you something durable about how they like things, add it to "
+    """The agent handles the user's reply to its question: carries out a choice with the permission it grants, or
+    answers a question about it and keeps it open. Resumes the session that asked, so it has the whole context."""
+    options = "; ".join(f"{i}. {o}" for i, o in enumerate(json.loads(d["options"] or "[]"), 1))
+    prompt = (f"You asked the user: {d['question']}\nYour options: {options}\nThe user replied: {answer}\n\n"
+              "Decide what their reply is.\n"
+              "- A choice or instruction (an option, 'yes', 'do it', 'push all', 'post it but drop the nit'): carry out "
+              "exactly that now and nothing beyond it. You have permission for the outward-facing actions it calls "
+              "for: push, post, comment, review, message. done = true, keep_open = false.\n"
+              "- A question about it, or unclear ('explain', 'why', 'what does that mean'): don't act. Answer in "
+              "`reply` plainly, like to a busy colleague, without hashes or ids. done = false, keep_open = true.\n"
+              + (f"If you post, post these drafts exactly as written, with any changes the user asked for:\n{d['drafts']}\n"
+                 if d["drafts"] else "")
+              + f"If their reply tells you something durable about how they like things, add it to "
                 f"{agent['dir']}/KNOWLEDGE.md.\n"
               + (f"This was a standing-rule question: if they agreed, write the rule into {agent['dir']}/"
                  f"{agent['job_file']} under '## Standing rules'.\n" if d["category"] == "standing-rule" else "")
-              + agent["act_instructions"])
+              + (agent["act_instructions"] + "\n" if agent["act_instructions"] else "")
+              + "Write `reply` like a short Claude Code chat reply.")
     run = conn.execute("SELECT session_id FROM runs WHERE id = ?", (d["run_id"],)).fetchone()
     sid, cwd = (run["session_id"], str(agent["dir"])) if run and session_exists(run["session_id"]) \
-        else (row["session_id"], row["cwd"])
-    call = lambda: run_claude(prompt, session_id=sid, resume=True, cwd=cwd,
-                              allowed=expand_tools(agent["tools"]["act"]["allow"]),
-                              denied=expand_tools(agent["tools"]["act"]["deny"]), schema=ACT_SCHEMA,
-                              model=agent["model"], mode="acceptEdits", add_dirs=agent["folders"],
-                              protect=protected(agent))
+        else ((row["session_id"], row["cwd"]) if row and session_exists(row["session_id"]) else (None, str(agent["dir"])))
+    resume = bool(sid)
+    sid = sid or str(uuid.uuid4())
+    allowed = list(dict.fromkeys(wake_tools(agent)[0] + GRANTABLE + expand_tools(agent["tools"]["act"]["allow"])))
+    call = lambda: run_claude(prompt, session_id=sid, resume=resume, cwd=cwd, allowed=allowed,
+                              denied=expand_tools(["@never"]), schema=ACT_SCHEMA, model=agent["model"],
+                              add_dirs=agent["folders"], protect=protected(agent))
     if quiet:
         out, c = call()
     else:
-        with console.status(f"{agent['name']} is carrying out your decision…"):
+        with console.status(f"{agent['name']} is on it…"):
             out, c = call()
+    out["summary"] = out["reply"]
     conn.execute("UPDATE runs SET cost_usd = cost_usd + ? WHERE id = (SELECT MAX(id) FROM runs WHERE agent = ?)",
                  (c, agent["name"]))
-    notify_event(agent, "done", f"{short_key(row['key'])}: {'done' if out['done'] else 'not done'} — {d['question'][:80]}",
-                 out["summary"], row["key"], conn)
+    if not out["keep_open"]:
+        notify_event(agent, "done", f"{short_key(d['item_key'])}: {'done' if out['done'] else 'not done'} — "
+                                    f"{d['question'][:80]}", out["reply"], d["item_key"], conn)
     return out
 
 
+def say(conn, agent_name, role, text):
+    """Add a line to the agent's conversation (its feed)."""
+    conn.execute("INSERT INTO chat (agent, role, text, ts) VALUES (?, ?, ?, ?)", (agent_name, role, text, now()))
+    conn.commit()
+
+
 def answer_decision(conn, agent, d, answer, quiet=True):
-    """Record an answer and have the agent carry it out. Returns the act result."""
+    """Hand the user's reply to the agent. A choice gets carried out; a question about it gets answered and the
+    question stays open. The exchange shows in the agent's feed like a conversation. Returns the act result."""
     row = conn.execute("SELECT * FROM items WHERE agent = ? AND key = ?", (d["agent"], d["item_key"])).fetchone()
+    say(conn, d["agent"], "user", f"> {d['question']}\n{answer}")
     conn.execute("UPDATE decisions SET status='answered', answer=?, answered_at=? WHERE id=?", (answer, now(), d["id"]))
     conn.commit()
-    apply_grant(d, answer)
     try:
         out = act(conn, agent, row, d, answer, quiet=quiet)
-        conn.execute("UPDATE decisions SET status=?, outcome=? WHERE id=?",
-                     ("done" if out["done"] else "answered", out["summary"], d["id"]))
-        conn.commit()
-        return out
     except Exception as e:
-        conn.execute("UPDATE decisions SET status='failed', outcome=? WHERE id=?", (str(e), d["id"]))
+        conn.execute("UPDATE decisions SET status='pending', answer=NULL, answered_at=NULL WHERE id=?", (d["id"],))
         conn.commit()
-        notify_event(agent, "error", f"{short_key(d['item_key'])}: could not carry out your decision", str(e), d["item_key"], conn)
+        say(conn, d["agent"], "agent", f"I couldn't do that, so the question is still open: {str(e)[:300]}")
+        notify_event(agent, "error", f"{short_key(d['item_key'])}: could not carry out your answer", str(e),
+                     d["item_key"], conn)
         raise
+    if out["keep_open"]:
+        conn.execute("UPDATE decisions SET status='pending', answer=NULL, answered_at=NULL WHERE id=?", (d["id"],))
+    else:
+        apply_grant(d, answer)
+        conn.execute("UPDATE decisions SET status=?, outcome=? WHERE id=?",
+                     ("done" if out["done"] else "answered", out["reply"], d["id"]))
+    conn.commit()
+    say(conn, d["agent"], "agent", out["reply"])
+    return out
+
+
+def cmd_answer(args):
+    """Answer a waiting question in your own words; the agent carries it out (or answers you, if you asked something)."""
+    conn = db()
+    d = conn.execute("SELECT * FROM decisions WHERE id = ? AND status = 'pending'", (args.id,)).fetchone()
+    if not d:
+        raise SystemExit(f"Question #{args.id} isn't waiting on an answer.")
+    out = answer_decision(conn, load_agent(d["agent"]), d, " ".join(args.answer))
+    print(out["reply"])
 
 
 def cmd_decide(args):
@@ -2490,6 +2542,9 @@ def main():
     sb = sub.add_parser("sidebar", help=argparse.SUPPRESS)
     sb.add_argument("action", choices=["fit", "grow", "shrink", "reset", "save"])
     sub.add_parser("open-feed", help=argparse.SUPPRESS).add_argument("agent")
+    an = sub.add_parser("answer", help="answer a waiting question in your own words; the agent carries it out")
+    an.add_argument("id", type=int)
+    an.add_argument("answer", nargs="+")
     sub.add_parser("feed", help="one agent's conversation: reports, messages and its questions").add_argument("agent")
     sub.add_parser("home", help="live home view: agents, decisions waiting on you, inbox")
     tl = sub.add_parser("threads", help="status of every item an agent tracks, with its own chat thread")
@@ -2576,7 +2631,7 @@ def main():
     {"status": cmd_status, "watch": cmd_watch, "agents": cmd_agents, "new": cmd_new, "remove": cmd_remove,
      "run": cmd_run, "show": cmd_show, "decide": cmd_decide, "chat": cmd_chat, "runs": cmd_runs,
      "schedule": cmd_schedule, "skills": cmd_skills, "edit": cmd_edit, "statusline": cmd_statusline,
-     "ui": cmd_ui, "nav": cmd_nav, "sidebar": cmd_sidebar, "home": cmd_home, "feed": cmd_feed, "open-feed": cmd_open_feed, "thread": cmd_thread, "threads": cmd_threads, "ask": cmd_ask, "pick": cmd_pick, "tick": cmd_tick, "watch-run": cmd_watch_run, "agent-status": cmd_agent_status, "brief": cmd_brief, "learn": cmd_learn, "split": cmd_split, "asks": cmd_asks, "answered": cmd_answered, "splits": cmd_splits, "open-split": cmd_open_split, "restore": cmd_restore, "inbox": cmd_inbox, "folders": cmd_folders,
+     "ui": cmd_ui, "nav": cmd_nav, "sidebar": cmd_sidebar, "home": cmd_home, "feed": cmd_feed, "open-feed": cmd_open_feed, "answer": cmd_answer, "thread": cmd_thread, "threads": cmd_threads, "ask": cmd_ask, "pick": cmd_pick, "tick": cmd_tick, "watch-run": cmd_watch_run, "agent-status": cmd_agent_status, "brief": cmd_brief, "learn": cmd_learn, "split": cmd_split, "asks": cmd_asks, "answered": cmd_answered, "splits": cmd_splits, "open-split": cmd_open_split, "restore": cmd_restore, "inbox": cmd_inbox, "folders": cmd_folders,
      None: cmd_status}[args.cmd](args)
 
 
