@@ -162,12 +162,23 @@ def launch():
         raise SystemExit("crew's workspace needs tmux: brew install tmux")
     HOME.mkdir(parents=True, exist_ok=True)
     CONF.write_text(TMUX_CONF % {"crew": shlex.quote(sys.executable) + " " + shlex.quote(CREW)})
-    if subprocess.run(["tmux", "-L", "crew", "has-session", "-t", SESSION], capture_output=True).returncode != 0:
+    running = subprocess.run(["tmux", "-L", "crew", "has-session", "-t", SESSION], capture_output=True).returncode == 0
+    if running and tmux("show-options", "-t", SESSION, "-v", "@crew_code") != code_id():
+        # the workspace was started by another crew (an older install or upgrade): start it fresh on this one.
+        # Agent chats are saved Claude Code sessions, so they pick up where they were when reopened.
+        tmux("kill-server")
+        running = False
+    if not running:
         create(*os.get_terminal_size())
     else:
         tmux("source-file", str(CONF))
     env = {k: v for k, v in os.environ.items() if k != "TMUX"}
     os.execvpe("tmux", ["tmux", "-L", "crew", "-f", str(CONF), "attach", "-t", SESSION], env)
+
+
+def code_id():
+    """Which crew this is: its path and version, so a workspace started by an older one is noticed."""
+    return f"{CREW}:{os.path.getmtime(CREW):.0f}"
 
 
 def create(columns, lines):
@@ -178,6 +189,7 @@ def create(columns, lines):
              crew_cmd("nav"), check=True)
         nav = tmux("display-message", "-p", "-t", f"{SESSION}:main", "#{pane_id}")
         tmux("set-option", "-t", SESSION, "@nav", nav)
+        tmux("set-option", "-t", SESSION, "@crew_code", code_id())
         tmux("set-option", "-p", "-t", nav, "@crew_title", "crew")
         home = tmux("split-window", "-h", "-d", "-t", nav, "-P", "-F", "#{pane_id}", crew_cmd("home"), check=True)
         tmux("set-option", "-p", "-t", home, "@crew_key", "home")

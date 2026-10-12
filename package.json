@@ -1,6 +1,6 @@
 {
   "name": "@sandydasari/crew",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Your own Claude Code agents that work on their own: brief one once, it does the work, keeps its own folder, and checks in only when something is yours to decide.",
   "keywords": [
     "claude",
