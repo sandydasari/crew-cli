@@ -49,7 +49,8 @@ class FeedApp(App):
     #hint {{ height: 1; color: {GRAPHITE}; }}
     """
     BINDINGS = [Binding("ctrl+n", "next_question", "next question"),
-                Binding("ctrl+x", "dismiss", "dismiss question")]
+                Binding("ctrl+x", "dismiss", "dismiss question"),
+                Binding("ctrl+l", "clear", "clear the feed")]
 
     def __init__(self, agent_name):
         super().__init__()
@@ -77,8 +78,9 @@ class FeedApp(App):
     # ---------------------------------------------------------- data
 
     def entries(self, conn):
-        """(ts, renderable) for wakes, chat messages and answered questions, oldest first."""
+        """(ts, renderable) for wakes, chat messages and answered questions, oldest first (since the last clear)."""
         out = []
+        since = crew.agent_state(self.agent).get("feed_since") or ""
         for r in conn.execute("""SELECT * FROM runs WHERE agent = ? AND (report IS NOT NULL OR status = 'error')
                                  ORDER BY id DESC LIMIT ?""", (self.name_, HISTORY)):
             head = Text()
@@ -106,6 +108,7 @@ class FeedApp(App):
             if d["outcome"] and d["outcome"] != d["answer"]:
                 parts.append(Markdown(d["outcome"]))
             out.append((d["answered_at"], Group(*parts)))
+        out = [e for e in out if (e[0] or "") >= since]
         out.sort(key=lambda e: e[0] or "")
         return out[-HISTORY:]
 
@@ -178,6 +181,7 @@ class FeedApp(App):
             if len(self.pending) > 1:
                 keys.append(("ctrl+n", "next question"))
             keys.append(("ctrl+x", "dismiss"))
+        keys.append(("ctrl+l", "clear"))
         keys += [("enter", "send (empty: full chat)"), ("alt ←", "rail")]
         t = Text()
         for k, word in keys:
@@ -210,6 +214,12 @@ class FeedApp(App):
             self.busy = f"Couldn't carry that out: {str(e)[:200]}"
         self.signature = None
         self.call_from_thread(self.render_feed)
+
+    def action_clear(self):
+        """Start the feed fresh. History stays in crew (crew runs, crew inbox); waiting questions stay."""
+        crew.agent_state(self.agent, feed_since=crew.now())
+        self.signature = None
+        self.render_feed()
 
     def action_next_question(self):
         if self.pending:
