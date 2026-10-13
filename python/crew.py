@@ -140,8 +140,9 @@ ACT_SCHEMA = {
         "done": {"type": "boolean", "description": "True when you carried out their answer, or it meant doing nothing."},
         "keep_open": {"type": "boolean", "description": "True when their reply was a question or unclear, so the question stays open."},
         "reply": {"type": "string", "description": "Markdown, short and plain: what you did (with links to anything posted or pushed), or your answer to their question. No hashes or ids."},
+        "follow_up": {"type": "string", "description": "When their answer needs long work (a deeper review, a big fix, anything over a couple of minutes): don't do it here. Say in `reply` that you're on it, and put what to do here; crew starts a background wake for it. Empty otherwise."},
     },
-    "required": ["done", "keep_open", "reply"],
+    "required": ["done", "keep_open", "reply", "follow_up"],
 }
 
 VERDICT_COLORS = {
@@ -429,6 +430,44 @@ def sandbox_prefix(paths):
 ACTIVITY = LOGS / "activity"  # one file per session: what a wake did, step by step, as it happens
 
 
+LIVE = {}  # session id -> the claude process working in it (in this process), so the feed can stop it
+STOPPED = set()
+
+
+def kill_tree(pid):
+    """Stop a process and everything under it. Claude Code runs commands in their own process groups, so stopping
+    its group alone would leave a test run or a sleep going (and holding its output open)."""
+    try:
+        rows = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True).stdout.split("\n")
+    except OSError:
+        rows = []
+    children = {}
+    for row in rows:
+        parts = row.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    tree, todo = [], [pid]
+    while todo:
+        p = todo.pop()
+        tree.append(p)
+        todo.extend(children.get(p, []))
+    for p in reversed(tree):  # deepest first
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def stop_work(session_id):
+    """Stop the work in a session, with everything it started (helpers, test runs)."""
+    proc = LIVE.get(session_id)
+    if not proc or proc.poll() is not None:
+        return False
+    STOPPED.add(session_id)
+    kill_tree(proc.pid)
+    return True
+
+
 def activity_path(session_id):
     return ACTIVITY / f"{session_id}.log"
 
@@ -472,7 +511,7 @@ def describe_step(block):
 
 
 def run_claude(prompt, *, session_id, resume, cwd, allowed, denied, schema, model, mode="dontAsk", add_dirs=(),
-               protect=(), timeout=CLAUDE_TIMEOUT):
+               protect=(), timeout=CLAUDE_TIMEOUT, on_step=None):
     """Run headless Claude Code and return (structured output, cost). Each step it takes is appended to
     activity_path(session_id) as it happens, so the feed can show the work live."""
     cmd = [*sandbox_prefix(protect), "claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
@@ -483,9 +522,15 @@ def run_claude(prompt, *, session_id, resume, cwd, allowed, denied, schema, mode
     ACTIVITY.mkdir(parents=True, exist_ok=True)
     raw = open(LOGS / f"{session_id or 'oneoff'}.{int(time.time())}.json", "w")
     steps = open(activity_path(session_id or "oneoff"), "a")
+    # its own process group: stopping it (or a timeout) also stops what it started, which could otherwise hold the
+    # output open and leave this waiting forever
     proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                            text=True)
-    timer = threading.Timer(timeout, proc.kill)  # a wake that hangs, even silently, is stopped on time
+                            text=True, start_new_session=True)
+    key = session_id or "oneoff"
+    LIVE[key] = proc
+    on_step and on_step("session", key)
+
+    timer = threading.Timer(timeout, kill_tree, args=(proc.pid,))  # a run that hangs, even silently, is stopped on time
     timer.start()
     result = None
     try:
@@ -505,15 +550,20 @@ def run_claude(prompt, *, session_id, resume, cwd, allowed, denied, schema, mode
                         steps.write(f"{dt.datetime.now():%H:%M:%S}\t{'helper' if helper else 'main'}\t"
                                     f"{text.replace(chr(9), ' ').replace(chr(10), ' ')}\n")
                         steps.flush()
+                        on_step and on_step("step", ("  ↳ " if helper else "") + text)
         proc.wait(timeout=30)
     finally:
         timed_out = not timer.is_alive() and proc.returncode not in (0, None)
         timer.cancel()
+        LIVE.pop(key, None)
         err = proc.stderr.read() if proc.stderr else ""
         raw.write("\n--- stderr ---\n" + err)
         raw.close()
         steps.close()
     if not result:
+        if key in STOPPED:
+            STOPPED.discard(key)
+            raise RuntimeError("stopped")
         if timed_out:
             raise RuntimeError(f"timed out after {timeout // 60} minutes")
         raise RuntimeError(f"claude exited {proc.returncode}: {err.strip()[-400:]}")
@@ -1313,6 +1363,11 @@ def cmd_learn(args):
 
 def cmd_run(args):
     names = [args.agent] if args.agent else agent_names()
+    if args.background:
+        for n in names:
+            start_background_run(n, trigger=args.trigger if args.trigger != "manual" else None, note=args.note)
+            print(f"{n} is working on it in the background; it shows in its feed.")
+        return
     for n in names:
         a = load_agent(n)
         if a.get("mode") == "agentic":
@@ -1597,8 +1652,9 @@ def chat_system(agent):
             "but drop the nit'), run `crew answer <id> \"<their words>\"`: crew has you carry it out with the "
             "permission their answer gives (pushing, posting) and prints what was done. Tell them that in a line or "
             "two. Don't push or post yourself from this chat, and never ask them to run commands or unblock tools.\n"
-            "To act on something now, run "
-            f"`crew run {agent['name']} --note \"<what they asked for>\"`. Every comment you'd post is a draft "
+            "For anything that takes more than a minute (a review, a fix, an investigation), run "
+            f"`crew run {agent['name']} --background --note \"<what they asked for>\"` and tell them you've started "
+            "it; they watch it live in your feed and you report there when it's done. Every comment you'd post is a draft "
             "until the user approves it.\n"
             "The user is messaging you about your work. Be direct; read-only unless they ask you to change your own files. "
             "Explain things the way Claude Code would in a chat — plain sentences, concrete specifics — and use the "
@@ -1641,7 +1697,8 @@ def save_chat_session(agent, sid, cwd):
 
 
 def send_message(agent, message, on_event=None):
-    """Send one message to an agent's own chat session and return its reply. on_event(kind, text) streams progress."""
+    """Send one message to an agent's own chat session and return its reply. on_event(kind, text) streams progress:
+    session (its id, to stop it), delta (reply text as it's written), step (a tool it used)."""
     conn = db()
     conn.execute("INSERT INTO chat (agent, role, text, ts) VALUES (?, 'user', ?, ?)", (agent["name"], message, now()))
     conn.commit()
@@ -1649,37 +1706,56 @@ def send_message(agent, message, on_event=None):
     new_sid = sid or str(uuid.uuid4())
     allowed, denied = chat_tools(agent)
     cwd.mkdir(parents=True, exist_ok=True)
-    cmd = ["claude", "-p", message, "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk"]
+    cmd = ["claude", "-p", message, "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+           "--permission-mode", "dontAsk"]
     cmd += claude_args(session_id=new_sid, resume=session_exists(sid), allowed=allowed, denied=denied, model=agent["model"],
                        add_dirs=agent["folders"], system=chat_system(agent))
-    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    reply, cost, error = [], 0.0, None
-    for line in proc.stdout:
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if ev.get("type") == "assistant":
-            for block in ev.get("message", {}).get("content", []):
-                if block.get("type") == "text" and block["text"].strip():
-                    reply.append(block["text"])
-                    on_event and on_event("text", block["text"])
-                elif block.get("type") == "tool_use":
-                    inp = block.get("input", {})
-                    hint = inp.get("command") or inp.get("file_path") or inp.get("skill") or inp.get("pattern") or ""
-                    on_event and on_event("tool", f"{block['name']} {str(hint)[:120]}".strip())
-        elif ev.get("type") == "result":
-            cost = ev.get("total_cost_usd") or 0
-            if ev.get("is_error"):
-                error = str(ev.get("result"))
-    proc.wait()
-    if proc.returncode and not reply:
-        error = error or proc.stderr.read().strip()[-400:]
-    if error and not reply:
-        raise RuntimeError(error)
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                            text=True, start_new_session=True)
+    LIVE[new_sid] = proc
+    on_event and on_event("session", new_sid)
+    texts, final, cost, error = [], None, 0.0, None
+    try:
+        for line in proc.stdout:
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = ev.get("type")
+            if kind == "stream_event" and not ev.get("parent_tool_use_id"):
+                delta = (ev.get("event") or {}).get("delta") or {}
+                if delta.get("type") == "text_delta":
+                    on_event and on_event("delta", delta.get("text", ""))
+            elif kind == "assistant":
+                for block in ev.get("message", {}).get("content", []):
+                    if block.get("type") == "text" and block["text"].strip():
+                        texts.append(block["text"])
+                        on_event and on_event("text", block["text"])
+                    elif block.get("type") == "tool_use":
+                        step = describe_step(block)
+                        step and on_event and on_event("step", ("  ↳ " if ev.get("parent_tool_use_id") else "") + step)
+            elif kind == "result":
+                cost = ev.get("total_cost_usd") or 0
+                final = ev.get("result")
+                if ev.get("is_error"):
+                    error = str(ev.get("result"))
+        proc.wait()
+    finally:
+        LIVE.pop(new_sid, None)
     if not sid:
         save_chat_session(agent, new_sid, cwd)
-    text = reply[-1] if reply else ""
+    if new_sid in STOPPED:
+        STOPPED.discard(new_sid)
+        text = (texts[-1] + "\n\n_(stopped)_") if texts else "_Stopped._"
+    else:
+        if proc.returncode and not texts and not final:
+            error = error or proc.stderr.read().strip()[-400:]
+        if error and not texts:
+            conn.execute("INSERT INTO chat (agent, role, text, ts) VALUES (?, 'agent', ?, ?)",
+                         (agent["name"], f"I couldn't reply: {error[:300]}", now()))
+            conn.commit()
+            raise RuntimeError(error)
+        text = final if isinstance(final, str) and final.strip() else (texts[-1] if texts else "")
     conn.execute("INSERT INTO chat (agent, role, text, ts, cost_usd) VALUES (?, 'agent', ?, ?, ?)",
                  (agent["name"], text, now(), cost))
     conn.commit()
@@ -1919,7 +1995,7 @@ def cmd_ask(args):
 
 # ---------------------------------------------------------------- decide
 
-def act(conn, agent, row, d, answer, quiet=False):
+def act(conn, agent, row, d, answer, quiet=False, on_step=None):
     """The agent handles the user's reply to its question: carries out a choice with the permission it grants, or
     answers a question about it and keeps it open. Resumes the session that asked, so it has the whole context."""
     options = "; ".join(f"{i}. {o}" for i, o in enumerate(json.loads(d["options"] or "[]"), 1))
@@ -1930,6 +2006,11 @@ def act(conn, agent, row, d, answer, quiet=False):
               "for: push, post, comment, review, message. done = true, keep_open = false.\n"
               "- A question about it, or unclear ('explain', 'why', 'what does that mean'): don't act. Answer in "
               "`reply` plainly, like to a busy colleague, without hashes or ids. done = false, keep_open = true.\n"
+              "- Not about this question at all (they're telling or asking you something else): reply to that as "
+              "you would in a chat, and leave the question for later. done = false, keep_open = true.\n"
+              "- Something that needs long work first ('review it more deeply', 'fix the rest'): don't start it here; "
+              "the user is waiting on your reply. Say you're on it in `reply`, describe the work in `follow_up`, "
+              "done = false, keep_open = false. crew runs it in the background and they watch it in your feed.\n"
               + (f"If you post, post these drafts exactly as written, with any changes the user asked for:\n{d['drafts']}\n"
                  if d["drafts"] else "")
               + f"If their reply tells you something durable about how they like things, add it to "
@@ -1946,7 +2027,7 @@ def act(conn, agent, row, d, answer, quiet=False):
     allowed = list(dict.fromkeys(wake_tools(agent)[0] + GRANTABLE + expand_tools(agent["tools"]["act"]["allow"])))
     call = lambda: run_claude(prompt, session_id=sid, resume=resume, cwd=cwd, allowed=allowed,
                               denied=expand_tools(["@never"]), schema=ACT_SCHEMA, model=agent["model"],
-                              add_dirs=agent["folders"], protect=protected(agent))
+                              add_dirs=agent["folders"], protect=protected(agent), on_step=on_step)
     if quiet:
         out, c = call()
     else:
@@ -1967,7 +2048,7 @@ def say(conn, agent_name, role, text):
     conn.commit()
 
 
-def answer_decision(conn, agent, d, answer, quiet=True):
+def answer_decision(conn, agent, d, answer, quiet=True, on_step=None):
     """Hand the user's reply to the agent. A choice gets carried out; a question about it gets answered and the
     question stays open. The exchange shows in the agent's feed like a conversation. Returns the act result."""
     row = conn.execute("SELECT * FROM items WHERE agent = ? AND key = ?", (d["agent"], d["item_key"])).fetchone()
@@ -1975,11 +2056,12 @@ def answer_decision(conn, agent, d, answer, quiet=True):
     conn.execute("UPDATE decisions SET status='answered', answer=?, answered_at=? WHERE id=?", (answer, now(), d["id"]))
     conn.commit()
     try:
-        out = act(conn, agent, row, d, answer, quiet=quiet)
+        out = act(conn, agent, row, d, answer, quiet=quiet, on_step=on_step)
     except Exception as e:
         conn.execute("UPDATE decisions SET status='pending', answer=NULL, answered_at=NULL WHERE id=?", (d["id"],))
         conn.commit()
-        say(conn, d["agent"], "agent", f"I couldn't do that, so the question is still open: {str(e)[:300]}")
+        say(conn, d["agent"], "agent", "Stopped. The question is still open." if str(e) == "stopped" else
+            f"I couldn't do that, so the question is still open: {str(e)[:300]}")
         notify_event(agent, "error", f"{short_key(d['item_key'])}: could not carry out your answer", str(e),
                      d["item_key"], conn)
         raise
@@ -1991,6 +2073,8 @@ def answer_decision(conn, agent, d, answer, quiet=True):
                      ("done" if out["done"] else "answered", out["reply"], d["id"]))
     conn.commit()
     say(conn, d["agent"], "agent", out["reply"])
+    if out.get("follow_up", "").strip():
+        start_background_run(d["agent"], trigger="your answer", note=out["follow_up"].strip())
     return out
 
 
@@ -2202,10 +2286,11 @@ def cmd_new(args):
                   f"crew ask {agent['name']} \"…\"[/]")
 
 
-def start_background_run(name, item=None, force=False, trigger=None):
+def start_background_run(name, item=None, force=False, trigger=None, note=None):
     """Kick off `crew run` detached, so it keeps going if the UI closes."""
     cmd = [sys.executable, str(Path(__file__).resolve()), "run", name]
     cmd += ["--trigger", trigger] if trigger else []
+    cmd += ["--note", note] if note else []
     cmd += ["--item", item] if item else []
     cmd += ["--force"] if force else []
     LOGS.mkdir(parents=True, exist_ok=True)
@@ -2594,6 +2679,7 @@ def main():
     r.add_argument("--force", action="store_true", help="re-work even if unchanged")
     r.add_argument("--trigger", default="manual", help=argparse.SUPPRESS)
     r.add_argument("--note", help="what you want it to look at this time")
+    r.add_argument("--background", action="store_true", help="start it and return right away")
     sub.add_parser("tick", help=argparse.SUPPRESS)
     wr = sub.add_parser("watch-run", help=argparse.SUPPRESS)
     wr.add_argument("agent")
