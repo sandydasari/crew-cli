@@ -1084,8 +1084,18 @@ def run_agentic(agent, trigger="manual", note=None):
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        console.print(f"[yellow]{name} is already awake.[/]")
+        if note:  # busy: the request waits its turn instead of being dropped
+            with open(agent["dir"] / ".requests", "a") as f:
+                f.write(json.dumps({"at": now(), "note": note}) + "\n")
+            console.print(f"{name} is busy; it picks this up as soon as it's done.")
+        else:
+            console.print(f"[yellow]{name} is already awake.[/]")
         return
+    queued = agent["dir"] / ".requests"
+    if queued.exists():  # requests that came in while it was busy
+        earlier = [json.loads(l)["note"] for l in queued.read_text().splitlines() if l.strip()]
+        queued.unlink()
+        note = "\n".join(x for x in [*earlier, note] if x) or None
     conn = db()
     st = agent_state(agent)
     if trigger != "you" and (st.get("paused_until") or "") > now():
@@ -1235,8 +1245,8 @@ def run_agentic(agent, trigger="manual", note=None):
         console.print(Text(f"{name}: {e}", style=PENCIL))
     finally:
         reconcile_watches(agent)
-        if (watch_dir(agent) / "events.log").exists():  # its watches fired while it worked: go again soon
-            agent_state(agent, next_wake_at=now())
+        if (watch_dir(agent) / "events.log").exists() or (d / ".requests").exists():
+            agent_state(agent, next_wake_at=now())  # its watches fired, or you asked for something, while it worked
 
 
 def usage_reset(message):
