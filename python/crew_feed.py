@@ -1,13 +1,14 @@
 """crew feed: talking to one agent. The conversation (its wake reports, your messages, its replies, streamed as it
 writes), what it's doing right now (live, stoppable with esc), and the question waiting on you, answered with a
-number key or in your own words. You can always type: while it's busy, your message waits its turn. Enter on an
-empty line opens the full Claude Code chat."""
+number key or in your own words. You can always type: while it's busy, your message waits its turn.
+ctrl+t opens the full Claude Code chat."""
 import hashlib
 import json
 import time
 
 from rich.console import Group
 from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
@@ -52,8 +53,8 @@ class FeedApp(App):
     .entry {{ margin-bottom: 1; }}
     /* yours: indented on a lifted ground with a green rule; the agent's: flush left; live work: a coral rule */
     .mine {{ margin: 0 0 1 6; background: {SELECT}; border-left: thick {DONE}; padding: 0 1; }}
-    .theirs {{ margin-right: 4; }}
-    .working {{ border-left: thick {PENCIL}; padding: 0 1; margin-right: 4; }}
+    .theirs {{ margin: 0 4 1 0; }}
+    .working {{ border-left: thick {PENCIL}; padding: 0 1; margin: 0 4 1 0; }}
     /* the question: a card of its own, set apart from the conversation */
     #asks {{ height: auto; max-height: 55%; border: round {PENCIL}; background: {SELECT}; padding: 0 1;
              margin-top: 1; scrollbar-size-vertical: 1; scrollbar-color: {RULE}; scrollbar-background: {SELECT}; }}
@@ -61,10 +62,13 @@ class FeedApp(App):
     #queue {{ height: auto; color: {GRAPHITE}; margin-top: 1; }}
     Input {{ background: {INK}; border: tall {RULE}; color: {PAPER}; margin-top: 1; }}
     Input:focus {{ border: tall {GRAPHITE}; }}
-    #hint {{ height: 1; color: {GRAPHITE}; }}
+    #hint {{ height: auto; color: {GRAPHITE}; }}
     """
     BINDINGS = [Binding("escape", "stop", "stop what it's doing"),
+                Binding("up", "prev_question", "previous question", show=False),
+                Binding("down", "next_question", "next question", show=False),
                 Binding("ctrl+n", "next_question", "next question"),
+                Binding("ctrl+t", "full_chat", "the full Claude Code chat"),
                 Binding("ctrl+x", "dismiss", "dismiss question"),
                 Binding("ctrl+e", "toggle_details", "the question's details"),
                 Binding("ctrl+o", "toggle_steps", "what each wake did"),
@@ -81,6 +85,7 @@ class FeedApp(App):
         self.show_details = False
         self.mounted = {}  # entry key -> (digest, widget): the conversation updates in place, no flicker
         self.ask_digest = None
+        self.answered = None  # (question, your answer, when): confirmed at the top of the card for a moment
 
     def compose(self) -> ComposeResult:
         yield Static(self.name_, id="head")
@@ -235,52 +240,79 @@ class FeedApp(App):
     # ---------------------------------------------------------- the question
 
     def render_asks(self):
+        """Every waiting question in one card: the selected one open with its choices, the rest one line each."""
         asks = self.query_one("#asks", VerticalScroll)
         msg = self.query_one("#msg", Input)
-        if not self.pending:
+        recent = self.answered if self.answered and time.time() - self.answered[2] < 20 else None
+        if not self.pending and not recent:
             asks.display = False
             msg.placeholder = f"Message {self.name_}"
             return
         asks.display = True
-        d = self.pending[self.active]
-        options = json.loads(d["options"])
-        msg.placeholder = f"Answer in your own words, or press 1–{len(options)}"
-        dig = digest(d["id"], d["question"], d["context"], d["drafts"], self.show_details, self.active, len(self.pending))
+        dig = digest([d["id"] for d in self.pending], self.active, self.show_details, recent,
+                     [(d["question"], d["context"], d["drafts"]) for d in self.pending])
         if dig == self.ask_digest:
             return
         self.ask_digest = dig
-        why, _, details = (d["context"] or "").partition(DETAILS)
-        head = Text()
-        head.append(f"{self.name_} asks", style=f"bold {PENCIL}")
-        if len(self.pending) > 1:
-            head.append(f"  ·  {self.active + 1} of {len(self.pending)}", style=GRAPHITE)
-        if d["item_key"]:
-            head.append(f"  ·  {crew.short_key(d['item_key'])}", style=GRAPHITE)
-        lines = [l for l in why.strip().splitlines() if l.strip()]
-        short = "\n".join(lines if self.show_details else lines[:4]) + \
-            ("\n…" if len(lines) > 4 and not self.show_details else "")
-        opts = Text()
-        for i, o in enumerate(options, 1):
-            opts.append("\n" if i > 1 else "")
-            opts.append(f" {i} ", style=f"bold {INK} on {PENCIL}")
-            opts.append(f"  {o}", style=PAPER)
-        parts = [head, Text(d["question"], style=f"bold {PAPER}"), Text("")]
-        if short.strip():
-            parts += [Markdown(short), Text("")]
-        parts.append(opts)
-        if d["recommendation"]:
-            parts += [Text(""), Text(f"Suggested: {d['recommendation']}", style=GRAPHITE)]
-        more = details.strip() or d["drafts"]
-        if self.show_details:
-            if details.strip():
-                parts += [Text(""), Text("Details", style=f"bold {GRAPHITE}"), Markdown(details.strip())]
-            if d["drafts"]:
-                parts += [Text(""), Text("What it would post", style=f"bold {GRAPHITE}"), Markdown(d["drafts"])]
-        elif more:
-            parts += [Text(""), Text("ctrl+e for details" + (" and what it would post" if d["drafts"] else ""),
-                                     style=GRAPHITE)]
+        parts = []
+        if recent:
+            done = Text()
+            done.append("✓ answered  ", style=f"bold {DONE}")
+            done.append(f"{recent[0][:70]}", style=f"strike {GRAPHITE}")
+            done.append(f"  →  {recent[1][:60]}", style=PAPER)
+            parts += [done, Text("")]
+        if not self.pending:
+            msg.placeholder = f"Message {self.name_}"
+            parts.append(Text("No more questions. Its reply shows in the conversation above.", style=GRAPHITE))
+            self.query_one("#ask", Static).update(Group(*parts))
+            return
+        n = len(self.pending)
+        title = Text()
+        title.append(f"{n} question{'s' if n > 1 else ''} from {self.name_}", style=f"bold {PENCIL}")
+        if n > 1:
+            title.append("   ↑ ↓ to move between them", style=GRAPHITE)
+        parts += [title, Text("")]
+        for i, d in enumerate(self.pending):
+            about = f"  ·  {crew.short_key(d['item_key'])}" if d["item_key"] else ""
+            if i != self.active:
+                row = Text()
+                row.append("  ○  ", style=GRAPHITE)
+                row.append(d["question"][:110], style=GRAPHITE)
+                row.append(about, style=GRAPHITE)
+                parts.append(row)
+                continue
+            options = json.loads(d["options"])
+            msg.placeholder = f"Press 1–{len(options)}, or type your answer"
+            row = Text()
+            row.append("  ●  ", style=f"bold {PENCIL}")
+            row.append(d["question"], style=f"bold {PAPER}")
+            row.append(about, style=GRAPHITE)
+            parts.append(row)
+            why, _, details = (d["context"] or "").partition(DETAILS)
+            lines = [l for l in why.strip().splitlines() if l.strip()]
+            short = "\n".join(lines if self.show_details else lines[:3]) + \
+                ("\n…" if len(lines) > 3 and not self.show_details else "")
+            body = []
+            if short.strip():
+                body.append(Markdown(short))
+            opts = Text()
+            for k, o in enumerate(options, 1):
+                opts.append("\n" if k > 1 else "")
+                opts.append(f" {k} ", style=f"bold {INK} on {PENCIL}")
+                opts.append(f"  {o}", style=PAPER)
+            body += [Text(""), opts]
+            if d["recommendation"]:
+                body.append(Text(f"\nSuggested: {d['recommendation']}", style=GRAPHITE))
+            if self.show_details:
+                if details.strip():
+                    body += [Text("\nDetails", style=f"bold {GRAPHITE}"), Markdown(details.strip())]
+                if d["drafts"]:
+                    body += [Text("\nWhat it would post", style=f"bold {GRAPHITE}"), Markdown(d["drafts"])]
+            elif details.strip() or d["drafts"]:
+                body.append(Text("\nctrl+e for details" + (" and what it would post" if d["drafts"] else ""),
+                                 style=GRAPHITE))
+            parts.append(Padding(Group(*body), (1, 0, 1, 5)))
         self.query_one("#ask", Static).update(Group(*parts))
-        asks.scroll_home(animate=False)
 
     def render_queue(self):
         q = self.query_one("#queue", Static)
@@ -300,12 +332,11 @@ class FeedApp(App):
         if self.pending:
             n = len(json.loads(self.pending[self.active]["options"]))
             keys.append((f"1–{n}", "answer"))
-            keys.append(("ctrl+e", "less" if self.show_details else "details"))
             if len(self.pending) > 1:
-                keys.append(("ctrl+n", "next"))
-            keys.append(("ctrl+x", "dismiss"))
-        keys += [("ctrl+o", "hide steps" if self.show_steps else "steps"), ("ctrl+l", "clear"),
-                 ("enter", "send · empty: full chat")]
+                keys.append(("↑↓", "other questions"))
+            keys += [("ctrl+e", "less" if self.show_details else "details"), ("ctrl+x", "dismiss")]
+        keys += [("enter", "send"), ("ctrl+o", "hide steps" if self.show_steps else "steps"), ("ctrl+l", "clear"),
+                 ("ctrl+t", "full chat")]
         t = Text()
         for k, word in keys:
             t.append(k, style=PAPER)
@@ -342,6 +373,10 @@ class FeedApp(App):
         """With a question in front of you, what you type answers it; otherwise it's a message."""
         if self.pending:
             d = self.pending[self.active]
+            self.answered = (d["question"], text, time.time())
+            self.pending = [x for x in self.pending if x["id"] != d["id"]]
+            self.active = min(self.active, max(0, len(self.pending) - 1))
+            self.show_details = False
             self.start_live("on it")
             self.carry_out(d, text)
         else:
@@ -365,7 +400,6 @@ class FeedApp(App):
         text = event.value.strip()
         event.input.value = ""
         if not text:
-            tx.show(f"agent:{self.name_}", tx.crew_cmd("chat", self.name_), self.name_, cwd=crew.AGENTS_DIR / self.name_)
             return
         if self.live:  # never block typing: it goes out when the current reply is done
             self.queue.append(text)
@@ -402,10 +436,19 @@ class FeedApp(App):
             self.render_queue()
 
     def action_next_question(self):
-        if self.pending:
+        if len(self.pending) > 1:
             self.active = (self.active + 1) % len(self.pending)
             self.show_details = False
             self.refresh_all()
+
+    def action_prev_question(self):
+        if len(self.pending) > 1:
+            self.active = (self.active - 1) % len(self.pending)
+            self.show_details = False
+            self.refresh_all()
+
+    def action_full_chat(self):
+        tx.show(f"agent:{self.name_}", tx.crew_cmd("chat", self.name_), self.name_, cwd=crew.AGENTS_DIR / self.name_)
 
     def action_dismiss(self):
         if not self.pending:

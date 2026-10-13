@@ -237,10 +237,9 @@ class NavApp(App):
             tx.show("new", tx.crew_cmd("new"), "new agent", restart=True)
 
     def decide(self, agent, key):
+        """Questions are answered in the agent's feed, where the whole list is."""
         self.mark_seen(agent, key)
-        num = crew.short_key(key).split("#")[-1]
-        tx.show(f"decide:{agent}:{key}", tx.crew_cmd("decide", agent, key), f"{agent}  ·  {num}  queries",
-                restart=f"decide:{agent}:{key}" not in tx.panes())
+        tx.show(f"feed:{agent}", tx.crew_cmd("feed", agent), agent)
 
     # ---------------------------------------------------------- actions
 
