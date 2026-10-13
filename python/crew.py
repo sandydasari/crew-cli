@@ -54,7 +54,10 @@ CONFIG_DEFAULTS = {
     # .git stays writable, so agents can still make their own worktrees from it.
     "protect": [],  # e.g. ["~/code/main-checkout"]
     "blocked_tools": [],  # more tool rules a wake must ask about first, e.g. ["Bash(deploy-tool create:*)"]
-    "terminal_app": None,  # bundle id brought forward when you click a notification; None = the one crew last ran in
+    "terminal_app": None,
+    # what an agent's chat may use without asking, besides reading: private things (docs, pages), not posting or
+    # sending. Anything public goes through a question you answer.
+    "chat_allow": ["Artifact", "mcp__claude_ai_Claude_Docs"],  # bundle id brought forward when you click a notification; None = the one crew last ran in
 }
 ICON = Path(__file__).resolve().parent.parent / "assets" / "icon.png"
 
@@ -129,7 +132,7 @@ TOOL_PRESETS = {
     ],
     "@never": ["Bash(gh pr merge:*)", "Bash(gh pr close:*)", "Bash(git push --force:*)", "Bash(git push -f:*)",
                "Bash(rm -rf:*)", "Bash(gh repo delete:*)", "Bash(gh secret:*)", "Bash(sudo:*)", "Bash(diskutil:*)",
-               "Bash(launchctl:*)", "Bash(crew decide:*)", "Bash(crew answered:*)", "Bash(crew answer:*)", "Bash(crew remove:*)",
+               "Bash(launchctl:*)", "Bash(crew decide:*)", "Bash(crew answered:*)", "Bash(crew answer:*)", "Bash(crew propose:*)", "Bash(crew remove:*)",
                "Bash(crew learn:*)", "Bash(crew run:*)", "Bash(crew tick:*)", "Bash(crew ui:*)", "Bash(crew chat:*)"],
 }
 GRANTABLE = [t for t in TOOL_PRESETS["@public"] if t not in TOOL_PRESETS["@never"]]
@@ -1623,7 +1626,7 @@ def chat_tools(agent):
     """The main chat: reads freely; anything that posts or pushes isn't pre-approved, so Claude Code asks the user."""
     own = f"//{str(agent['dir']).lstrip('/')}/**"
     allowed = expand_tools(agent["tools"]["run"]["allow"]) + [
-        "Bash(crew:*)", "Bash(sqlite3:*)", f"Edit({own})"]  # Edit rules cover every file-writing tool
+        "Bash(crew:*)", "Bash(sqlite3:*)", f"Edit({own})"] + config()["chat_allow"]  # Edit covers every file write
     denied = ["Bash(crew decide:*)", "Bash(crew chat:*)", "Bash(crew ui:*)", "Bash(crew remove:*)", "Bash(crew watch:*)",
               "Bash(gh pr merge:*)", "Bash(git push --force:*)", "Bash(git push -f:*)"]
     return allowed, denied
@@ -1662,6 +1665,14 @@ def chat_system(agent):
             "but drop the nit'), run `crew answer <id> \"<their words>\"`: crew has you carry it out with the "
             "permission their answer gives (pushing, posting) and prints what was done. Tell them that in a line or "
             "two. Don't push or post yourself from this chat, and never ask them to run commands or unblock tools.\n"
+            "What you can do yourself here: read anything, create and edit Claude docs, write files in your folder {agent['dir']} (put scratch files and page sources "
+            "there). For anything public or done as the user that isn't already a question (posting, commenting, "
+            "pushing, sending a message, changing a ticket), ask them with "
+            f"`crew propose {agent['name']} \"<one plain question>\" --option \"<yours>\" --option \"<other>\" "
+            "--context \"<why, 2-4 plain lines>\" --drafts \"<the exact text>\" --about <owner/repo#n>`. It shows in "
+            "their feed; their answer is carried out with permission. Tell them you've asked, in one line. Always ask "
+            "this way, never with 'reply yes' in your message: a reply in this chat can't post or push, an answered "
+            "question can.\n"
             "For anything that takes more than a minute (a review, a fix, an investigation), run "
             f"`crew run {agent['name']} --background --note \"<what they asked for>\"` and tell them you've started "
             "it; they watch it live in your feed and you report there when it's done. Every comment you'd post is a draft "
@@ -2086,6 +2097,24 @@ def answer_decision(conn, agent, d, answer, quiet=True, on_step=None):
     if out.get("follow_up", "").strip():
         start_background_run(d["agent"], trigger="your answer", note=out["follow_up"].strip())
     return out
+
+
+def cmd_propose(args):
+    """From an agent's chat: ask the user a question in its feed. Their answer is carried out with permission."""
+    agent = load_agent(args.agent)
+    conn = db()
+    key = args.about or "chat"
+    conn.execute("""INSERT INTO items (agent, key, title, url, data, version, in_queue, run_count, last_run_at)
+                    VALUES (?, ?, ?, NULL, '{}', ?, 1, 0, ?) ON CONFLICT(agent, key) DO NOTHING""",
+                 (agent["name"], key, args.question[:120], now(), now()))
+    sid, _ = chat_session(agent)
+    rid = conn.execute("""INSERT INTO decisions (agent, item_key, run_id, question, context, options, recommendation,
+                          drafts, created_at, category, grant_tools) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, '[]')""",
+                       (agent["name"], key, args.question, args.context or "", json.dumps(args.option),
+                        args.option[0], args.drafts or "", now(), args.category or "from-chat")).lastrowid
+    conn.commit()
+    notify_event(agent, "decision", args.question, args.context or "", key, conn)
+    print(f"Asked #{rid}. The user answers it in your feed; their answer is carried out then.")
 
 
 def cmd_answer(args):
@@ -2637,6 +2666,14 @@ def main():
     sb = sub.add_parser("sidebar", help=argparse.SUPPRESS)
     sb.add_argument("action", choices=["fit", "grow", "shrink", "reset", "save"])
     sub.add_parser("open-feed", help=argparse.SUPPRESS).add_argument("agent")
+    pr = sub.add_parser("propose", help="(for an agent's chat) ask the user a question in its feed")
+    pr.add_argument("agent")
+    pr.add_argument("question")
+    pr.add_argument("--option", action="append", required=True, help="a choice, yours first (repeat 2-4 times)")
+    pr.add_argument("--context", help="2-4 plain lines: why it's their call")
+    pr.add_argument("--drafts", help="the exact text you'd post or send")
+    pr.add_argument("--about", help="owner/repo#number, or a short topic key")
+    pr.add_argument("--category", help="kind of question, the same each time")
     an = sub.add_parser("answer", help="answer a waiting question in your own words; the agent carries it out")
     an.add_argument("id", type=int)
     an.add_argument("answer", nargs="+")
@@ -2727,7 +2764,7 @@ def main():
     {"status": cmd_status, "watch": cmd_watch, "agents": cmd_agents, "new": cmd_new, "remove": cmd_remove,
      "run": cmd_run, "show": cmd_show, "decide": cmd_decide, "chat": cmd_chat, "runs": cmd_runs,
      "schedule": cmd_schedule, "skills": cmd_skills, "edit": cmd_edit, "statusline": cmd_statusline,
-     "ui": cmd_ui, "nav": cmd_nav, "sidebar": cmd_sidebar, "home": cmd_home, "feed": cmd_feed, "open-feed": cmd_open_feed, "answer": cmd_answer, "thread": cmd_thread, "threads": cmd_threads, "ask": cmd_ask, "pick": cmd_pick, "tick": cmd_tick, "watch-run": cmd_watch_run, "agent-status": cmd_agent_status, "brief": cmd_brief, "learn": cmd_learn, "split": cmd_split, "asks": cmd_asks, "answered": cmd_answered, "splits": cmd_splits, "open-split": cmd_open_split, "restore": cmd_restore, "inbox": cmd_inbox, "folders": cmd_folders,
+     "ui": cmd_ui, "nav": cmd_nav, "sidebar": cmd_sidebar, "home": cmd_home, "feed": cmd_feed, "open-feed": cmd_open_feed, "answer": cmd_answer, "propose": cmd_propose, "thread": cmd_thread, "threads": cmd_threads, "ask": cmd_ask, "pick": cmd_pick, "tick": cmd_tick, "watch-run": cmd_watch_run, "agent-status": cmd_agent_status, "brief": cmd_brief, "learn": cmd_learn, "split": cmd_split, "asks": cmd_asks, "answered": cmd_answered, "splits": cmd_splits, "open-split": cmd_open_split, "restore": cmd_restore, "inbox": cmd_inbox, "folders": cmd_folders,
      None: cmd_status}[args.cmd](args)
 
 
