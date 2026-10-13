@@ -17,16 +17,25 @@ CREW = str(Path(__file__).resolve().parent / "crew.py")
 SIDEBAR_WIDTH = 42  # default; your own width is remembered in ~/.crew/sidebar_width
 WIDTH_FILE = HOME / "sidebar_width"
 
-TMUX_CONF = """
+TMUX_CONF = r"""
 set -g mouse on
-# copying: a mouse drag copies to the macOS clipboard; apps' own copies (OSC 52) reach the terminal too
+# copying, like herdr: crew selects and copies itself, whatever the pane's app (feed, sidebar, Claude Code) does
+# with the mouse. Drag to select and it's copied on release; double-click a word, triple-click a line. Clicks and
+# scrolling still go to the app.
 set -s set-clipboard on
 set -g allow-passthrough on
 set -as terminal-features ',*:clipboard'
-bind -T copy-mode MouseDragEnd1Pane send -X copy-pipe-and-cancel "pbcopy"
-bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "pbcopy"
-bind -T copy-mode DoubleClick1Pane select-pane \\; send -X select-word \\; send -X copy-pipe-and-cancel "pbcopy"
-bind -T copy-mode-vi DoubleClick1Pane select-pane \\; send -X select-word \\; send -X copy-pipe-and-cancel "pbcopy"
+bind -n MouseDrag1Pane select-pane -t = \; copy-mode -M
+bind -n DoubleClick1Pane select-pane -t = \; copy-mode -H \; send -X select-word \; send -X copy-pipe-and-cancel "pbcopy" \; display-message "copied"
+bind -n TripleClick1Pane select-pane -t = \; copy-mode -H \; send -X select-line \; send -X copy-pipe-and-cancel "pbcopy" \; display-message "copied"
+bind -T copy-mode MouseDragEnd1Pane send -X copy-pipe-and-cancel "pbcopy" \; display-message "copied"
+bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "pbcopy" \; display-message "copied"
+bind -T copy-mode DoubleClick1Pane select-pane \; send -X select-word \; send -X copy-pipe-and-cancel "pbcopy" \; display-message "copied"
+bind -T copy-mode-vi DoubleClick1Pane select-pane \; send -X select-word \; send -X copy-pipe-and-cancel "pbcopy" \; display-message "copied"
+bind -T copy-mode TripleClick1Pane select-pane \; send -X select-line \; send -X copy-pipe-and-cancel "pbcopy" \; display-message "copied"
+bind -T copy-mode-vi TripleClick1Pane select-pane \; send -X select-line \; send -X copy-pipe-and-cancel "pbcopy" \; display-message "copied"
+bind -T copy-mode Escape send -X cancel
+set -g display-time 900
 set -s escape-time 0
 set -g focus-events on
 set -s extended-keys on
